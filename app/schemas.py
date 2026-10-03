@@ -660,6 +660,83 @@ class HandoverOrderSubmitResponse(BaseModel):
     order: HandoverOrderOut
 
 
+# ------------------------------------------------------------ 跨审定窗口连续暴露复核
+
+class ExposureReviewCertificateRef(BaseModel):
+    """跨窗复核引用的当前可用证书（含撤销标示；正常复核时 revoked 恒为 false）。"""
+
+    id: int
+    window_id: int
+    version: int
+    verdict: str
+    verdict_label_zh: str
+    issued_at: str
+    note: Optional[str]
+    revoked: bool = False
+    revocation: Optional[RevocationInfoOut] = None
+
+
+class ExposureReviewWindowOut(BaseModel):
+    """跨窗复核中的一段窗口（含来源证书与该窗按快照还原的状态时长统计）。"""
+
+    seq: int = Field(..., description="按输入时间顺序的窗口序号（从 0 起）")
+    window_id: int
+    window_start_at: str = Field(..., description="窗口起点（含，UTC）")
+    window_end_at: str = Field(..., description="窗口终点（不含；半开，UTC）")
+    duration_seconds: float
+    allowed_temp_min: float
+    allowed_temp_max: float
+    certificate_id: int = Field(..., description="该窗当前可用证书标识（复核依据）")
+    certificate_version: int
+    segment_count: int = Field(..., description="该窗还原出的半开区段数（同证据相邻段已合并）")
+    normal_seconds: float
+    exceeded_seconds: float
+    unknown_seconds: float
+    max_continuous_exceeded_seconds_within: float = Field(
+        ..., description="该窗自身的最长连续超限时长（不跨窗累计，仅供逐窗参考）")
+
+
+class ExposureReviewSegmentOut(BaseModel):
+    """全程时间线上的一个半开区段（从来源证书不可变快照还原）。"""
+
+    seq: int = Field(..., description="全程区段序号（按时间从 0 起）")
+    start: str
+    end: str
+    duration_seconds: float
+    status: str = Field(..., description="normal | exceeded | unknown（unknown 含故障遮蔽）")
+    evidence: dict[str, Any] = Field(
+        ..., description="区段证据：已知区段 {reading_id,revision}；"
+                        "未知区段含 unknown_reason=sample_gap|boundary_gap|instrument_fault 及相应引用")
+    window_id: int = Field(..., description="区段所属窗口")
+    certificate_id: int = Field(..., description="区段来源证书（不可变快照）")
+    certificate_version: int
+
+
+class ExposureReviewOut(BaseModel):
+    """跨审定窗口连续温度暴露复核结果（只依据各证书不可变快照）。"""
+
+    certificates: list[ExposureReviewCertificateRef] = Field(
+        ..., description="按输入时间顺序排列的各窗当前可用证书")
+    windows: list[ExposureReviewWindowOut] = Field(..., description="逐窗状态与来源证书")
+    segments: list[ExposureReviewSegmentOut] = Field(
+        ..., description="全程逐段状态（半开、按时间升序、首尾相接无缝覆盖全程）")
+    segment_count: int
+    start_at: str = Field(..., description="全程起点（首个窗口起点，含，UTC）")
+    end_at: str = Field(..., description="全程终点（末个窗口终点，不含；半开，UTC）")
+    total_duration_seconds: float
+    normal_total_seconds: float
+    exceeded_total_seconds: float
+    unknown_total_seconds: float = Field(..., description="全程未知总时长（秒，含故障遮蔽）")
+    has_unknown: bool
+    max_continuous_exceeded_seconds: float = Field(
+        ..., description="全程最长连续超限时长（跨窗边界两侧均超限时连续累计；正常/未知切断）")
+    max_continuous_exceed_limit_seconds: float = Field(
+        ..., description="请求给定的全程连续超限上限（秒）")
+    verdict: str = Field(..., description="fail | pending | pass")
+    verdict_label_zh: str
+    conclusion_zh: str
+
+
 class ErrorBody(BaseModel):
     detail: str
 

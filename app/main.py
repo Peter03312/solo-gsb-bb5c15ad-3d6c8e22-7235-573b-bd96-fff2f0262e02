@@ -15,6 +15,7 @@ from .schemas import (
     CertificateRevokeResponse,
     CertificateRevokeSubmit,
     EvaluationOut,
+    ExposureReviewOut,
     FaultPeriodOut,
     FaultPeriodResponse,
     FaultPeriodSubmit,
@@ -54,7 +55,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
@@ -71,7 +72,13 @@ app = FastAPI(
         "馆员办理展柜移交时凭非空移交单号与非空窗口标识列表申请放行："
         "逐窗口核对当前可用证书且结论合格才一次登记（固化证书标识/版本/结论），"
         "查询时按同一已提交状态核对引用证书，任一撤销或已有更新版本即整单失效"
-        "（失效不可逆，后续再签发不恢复）。"
+        "（失效不可逆，后续再签发不恢复）；"
+        "馆员复核一件展品跨多个审定窗口的连续温度暴露时，输入按时间排列的至少"
+        "两张各窗口当前可用证书与正数全程连续超限上限：窗口须首尾相接且温度上下限"
+        "一致，只从各证书不可变快照还原半开区段（不采用当前读数或规则），跨窗"
+        "边界两侧超限连续累计、正常或未知（含故障遮蔽）切断，输出逐段状态与来源"
+        "证书、全程最长连续超限/未知总时长与结论；证书或窗口不满足条件即明确拒绝、"
+        "不出具部分结果（只读，不改证书或移交单）。"
     ),
     lifespan=lifespan,
 )
@@ -435,6 +442,42 @@ def get_revision_report(
     两 ID 相同均返回 422；证书不存在返回 404。
     """
     return services.revision_report(conn, old_certificate_id, new_certificate_id)
+
+
+# 注意：本静态路径与 revision-report 一样，必须注册在
+# /api/v1/certificates/{certificate_id} 之前，否则 "exposure-review" 会先被
+# {certificate_id:int} 匹配并触发 422。
+@app.get("/api/v1/certificates/exposure-review",
+         response_model=ExposureReviewOut, tags=["certificates"])
+def get_cross_window_exposure_review(
+    certificate_id: list[int] = Query(
+        ..., min_length=2,
+        description="按时间排列的至少两张证书主键 ID（各须为所属窗口当前可用版本）；"
+                    "重复传参表示多张，如 ?certificate_id=1&certificate_id=2"),
+    max_continuous_exceed_seconds: float = Query(
+        ..., gt=0,
+        description="全程连续超限上限（秒，正数）；全程最长连续超限严格大于它判不合格"),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """馆员复核一件展品跨多个审定窗口的连续温度暴露。
+
+    输入按时间排列的至少两张证书标识（重复 query 参数）与正数全程连续超限
+    上限（秒）：
+    - 证书须分别是所属窗口**当前可用版本**（最新签发且未撤销）；已撤销或非
+      最新版 -> 409；证书不存在 -> 404；
+    - 证书标识重复（含两证同属一个窗口）、少于两张、上限非正 -> 422；
+    - 窗口须**首尾相接**（前一窗口终点恰为后一窗口起点）且按时间升序、各窗
+      允许温度上下限一致，否则 422，**明确拒绝、不出具部分结果**；
+    - 从各证书**不可变快照**还原半开审定区段（采样保持/间隔超限/边界空白/
+      故障遮蔽），**不采用当前读数或规则**；只读，不改证书或移交单，全程在
+      同一读事务内取同一已提交状态。
+    - 跨窗边界两侧均超限时连续累计；正常或未知（含故障遮蔽）切断累计。
+      全程最长连续超限**严格超过**上限 -> fail；否则有未知 -> pending；其余 pass。
+    """
+    # 读事务：多次读取看到同一已提交快照，不与并发签发/撤销撕裂；只读不落写
+    with read_transaction(conn):
+        return services.cross_window_exposure_review(
+            conn, certificate_id, max_continuous_exceed_seconds)
 
 
 @app.post(

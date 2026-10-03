@@ -437,3 +437,58 @@ api POST /api/v1/handover-orders "{\"handover_no\":\"$HNO\",\"window_ids\":[$H1,
 api POST "/api/v1/windows/$H1/certificates/issue" '{"note":"撤销后重签"}' >/dev/null
 api GET /api/v1/handover-orders/$HNO \
   | python3 -c "import sys,json;o=json.load(sys.stdin);print('再签发后 status:',o['status']);print('明细仍固化:',[(i['certificate_id'],i['certificate_version'],i['verdict']) for i in o['items']])"
+
+# ============================================================
+# 18. 跨审定窗口连续温度暴露复核（一件展品跨多个首尾相接窗口）
+# ============================================================
+# 只依据各窗口【当前可用证书的不可变快照】还原半开审定区段，不读当前读数/规则；
+# 证书标识按时间排列（重复 query 参数），另给正数全程连续超限上限（秒）。
+
+echo "-- 18.1 准备两个首尾相接窗口 X[03:00,03:10) / Y[03:10,03:20)（温度区间同为 18~22°C）--"
+EX=$(api POST /api/v1/windows '{
+  "name": "展柜X-跨窗复核", "start_at": "2026-10-03T03:00:00Z", "end_at": "2026-10-03T03:10:00Z",
+  "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300, "max_sample_interval_seconds": 600
+}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+EY=$(api POST /api/v1/windows '{
+  "name": "展柜Y-跨窗复核", "start_at": "2026-10-03T03:10:00Z", "end_at": "2026-10-03T03:20:00Z",
+  "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300, "max_sample_interval_seconds": 600
+}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+# 窗X 末段 [03:05,03:10) 超限 300s；窗Y 首段 [03:10,03:15) 也超限 300s（跨边界=600s）
+for spec in '"a","2026-10-03T03:00:00Z",20.0' '"b","2026-10-03T03:05:00Z",23.0' '"c","2026-10-03T03:10:00Z",23.0'; do
+  rid=$(echo "$spec" | cut -d, -f1 | tr -d '"'); ts=$(echo "$spec" | cut -d, -f2 | tr -d '"'); tp=$(echo "$spec" | cut -d, -f3)
+  api POST "/api/v1/windows/$EX/readings" "{\"reading_id\":\"$rid\",\"revision\":1,\"measured_at\":\"$ts\",\"temperature\":$tp}" >/dev/null
+done
+for spec in '"a","2026-10-03T03:10:00Z",23.0' '"b","2026-10-03T03:15:00Z",20.0' '"c","2026-10-03T03:20:00Z",20.0'; do
+  rid=$(echo "$spec" | cut -d, -f1 | tr -d '"'); ts=$(echo "$spec" | cut -d, -f2 | tr -d '"'); tp=$(echo "$spec" | cut -d, -f3)
+  api POST "/api/v1/windows/$EY/readings" "{\"reading_id\":\"$rid\",\"revision\":1,\"measured_at\":\"$ts\",\"temperature\":$tp}" >/dev/null
+done
+ECX=$(api POST "/api/v1/windows/$EX/certificates/issue" '{"note":"跨窗复核-窗X"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+ECY=$(api POST "/api/v1/windows/$EY/certificates/issue" '{"note":"跨窗复核-窗Y"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+
+echo "-- 18.2 复核（上限 600s：最长恰为 600s，等于不算超过 -> 合格；逐段带来源证书）--"
+api GET "/api/v1/certificates/exposure-review?certificate_id=$ECX&certificate_id=$ECY&max_continuous_exceed_seconds=600" \
+  | python3 -m json.tool
+
+echo "-- 18.3 严格超过：上限 599s -> 不合格 --"
+api GET "/api/v1/certificates/exposure-review?certificate_id=$ECX&certificate_id=$ECY&max_continuous_exceed_seconds=599" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('verdict:',d['verdict'],'最长连续超限:',d['max_continuous_exceeded_seconds'])"
+
+echo "-- 18.4 拒绝路径：重复证书/少于两张/非正上限 422；不存在 404；已撤销或非最新版 409；窗口不接续/温度范围不一致/倒序 422 --"
+api GET "/api/v1/certificates/exposure-review?certificate_id=$ECX&certificate_id=$ECX&max_continuous_exceed_seconds=600" || true
+api GET "/api/v1/certificates/exposure-review?certificate_id=$ECX&max_continuous_exceed_seconds=600" || true
+api GET "/api/v1/certificates/exposure-review?certificate_id=$ECX&certificate_id=$ECY&max_continuous_exceed_seconds=0" || true
+api GET "/api/v1/certificates/exposure-review?certificate_id=$ECX&certificate_id=99999&max_continuous_exceed_seconds=600" || true
+# 窗X 再签一版：旧版 $ECX 即使未撤销也非最新版 -> 409
+ECX2=$(api POST "/api/v1/windows/$EX/certificates/issue" '{"note":"v2"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+api GET "/api/v1/certificates/exposure-review?certificate_id=$ECX&certificate_id=$ECY&max_continuous_exceed_seconds=600" || true
+# 倒序 -> 422
+api GET "/api/v1/certificates/exposure-review?certificate_id=$ECY&certificate_id=$ECX2&max_continuous_exceed_seconds=600" || true
+# 撤销最新版 -> 409（撤销最新版不自动退回旧版）
+api POST "/api/v1/certificates/$ECX2/revocation" '{"reason":"签发依据有误"}' >/dev/null
+api GET "/api/v1/certificates/exposure-review?certificate_id=$ECX2&certificate_id=$ECY&max_continuous_exceed_seconds=600" || true
+echo "（以上拒绝均不出具部分结果；复核为只读，不撤销/不改证书或移交单）"

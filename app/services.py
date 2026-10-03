@@ -8,6 +8,7 @@ from typing import Any, Optional
 from fastapi import HTTPException, status
 
 from .evaluation import evaluate
+from .exposure import ExposureReviewError, build_cross_window_review
 from .models import (
     FAULT_ACTIVE,
     FAULT_WITHDRAWN,
@@ -1486,3 +1487,77 @@ def handover_order_to_dict(
         "created_at": order_row["created_at"],
         "items": item_dicts,
     }
+
+
+# -------------------------------------------------------- 跨审定窗口连续暴露复核
+
+def cross_window_exposure_review(
+    conn: sqlite3.Connection,
+    certificate_ids: list[int],
+    max_continuous_exceed_seconds: float,
+) -> dict[str, Any]:
+    """馆员复核一件展品跨多个审定窗口的连续温度暴露。
+
+    输入按时间排列的至少两张证书标识与正数全程连续超限上限（秒）。只在一个
+    读事务内完成全部核验与读取（同一已提交状态，不改证书或移交单），并只从
+    各证书**不可变快照**还原半开审定区段（不采用当前读数或当前规则）。
+
+    逐项核验（任一不满足即整单拒绝，不出具部分结果）：
+    - 少于 2 张 / 证书标识重复 -> 422；
+    - 任一证书不存在 -> 404；
+    - 任一证书已撤销，或不是所属窗口的最新签发版本（非当前可用证书）-> 409；
+    - 快照窗口不首尾相接/未按时间排列、各窗允许温度上下限不一致 -> 422
+      （由 build_cross_window_review 抛 ExposureReviewError）。
+    """
+    if len(certificate_ids) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"跨窗连续暴露复核至少需要 2 张证书，实际收到 {len(certificate_ids)} 张。",
+        )
+    if len(set(certificate_ids)) != len(certificate_ids):
+        dupes = sorted({cid for cid in certificate_ids if certificate_ids.count(cid) > 1})
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"证书标识重复 {dupes}：跨窗复核的每张证书须唯一，重复或同一证书"
+                   "多次出现时拒绝复核（包括两张证书属于同一审定窗口的情形）。",
+        )
+
+    # 1) 逐张取证书（任一不存在 -> 404）
+    rows = [get_certificate_row(conn, cid) for cid in certificate_ids]
+
+    # 2) 逐张核验：未撤销且为所属窗口最新签发版本（即当前可用证书）。
+    #    已撤销，或所属窗口已有更新签发版本（该证不是当前可用版本）-> 409。
+    for row in rows:
+        if row["revoked_reason"] is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"证书 {row['id']}（窗口 {row['window_id']}，版本 {row['version']}）"
+                    "已撤销，不能作为跨窗连续暴露复核依据；"
+                    "请使用各窗口撤销后重新签发的当前可用证书。"
+                ),
+            )
+        latest = conn.execute(
+            "SELECT id, version FROM certificates WHERE window_id=? "
+            "ORDER BY version DESC LIMIT 1",
+            (row["window_id"],),
+        ).fetchone()
+        if latest is None or latest["id"] != row["id"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"证书 {row['id']}（窗口 {row['window_id']}，版本 {row['version']}）"
+                    "不是所属窗口的最新签发版本"
+                    f"（当前最新版本为版本 {latest['version'] if latest else '?'}）；"
+                    "跨窗连续暴露复核只接受各窗口当前可用版本证书"
+                    "（旧版本即使未撤销也须以最新版替换）。"
+                ),
+            )
+
+    certs = [certificate_to_dict(row) for row in rows]
+    try:
+        return build_cross_window_review(certs, float(max_continuous_exceed_seconds))
+    except ExposureReviewError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc

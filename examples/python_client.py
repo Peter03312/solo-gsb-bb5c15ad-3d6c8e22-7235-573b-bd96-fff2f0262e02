@@ -29,6 +29,11 @@
      409（整单不留记录）；同单号同窗口集合（不计顺序）重放幂等返回原单
      及当前状态，集合不同 409；查询时保留登记明细，任一引用证书撤销或
      已有更新版本即整单失效，失效不可逆（后续再签发不恢复）。
+ 10) 跨审定窗口连续温度暴露复核：输入按时间排列的至少两张各窗当前可用
+     证书与正数全程连续超限上限，只从各证书不可变快照还原半开区段（不读
+     当前读数/规则）；窗口首尾相接且温度上下限一致，跨窗边界两侧超限连续
+     累计、正常/未知（含故障遮蔽）切断；严格超限不合格，否则有未知待定，
+     其余合格；重复/不存在、已撤销/非最新版、窗口不接续/温度不一致均拒绝。
 """
 from __future__ import annotations
 
@@ -712,8 +717,103 @@ def handover_demo() -> None:
     print("单号不存在查询: 404")
 
 
+def _raw_window(name, start_at, end_at, *, tmin=18.0, tmax=22.0,
+                max_exceed=300, max_gap=600):
+    _, w = call("POST", "/api/v1/windows", {
+        "name": name, "start_at": start_at, "end_at": end_at,
+        "allowed_temp_min": tmin, "allowed_temp_max": tmax,
+        "max_continuous_exceed_seconds": max_exceed,
+        "max_sample_interval_seconds": max_gap,
+    })
+    return w["id"]
+
+
+def _raw_reading(wid, rid, ts, temp, rev=1):
+    code, r = call("POST", f"/api/v1/windows/{wid}/readings", {
+        "reading_id": rid, "revision": rev,
+        "measured_at": ts, "temperature": temp})
+    assert code == 201, r
+    return r
+
+
+def exposure_review(cert_ids, limit):
+    qs = "&".join([f"certificate_id={cid}" for cid in cert_ids]
+                  + [f"max_continuous_exceed_seconds={limit}"])
+    return call("GET", f"/api/v1/certificates/exposure-review?{qs}")
+
+
+def exposure_review_demo() -> None:
+    """一件展品跨两个首尾相接审定窗口的连续温度暴露复核。
+
+    只依据各窗口当前可用证书的不可变快照还原半开区段：
+    窗X [03:00,03:10) 末段 [03:05,03:10) 超限 300s，
+    窗Y [03:10,03:20) 首段 [03:10,03:15) 也超限 300s —— 跨窗边界两侧均超限，
+    连续累计 600s；全程上限 600s 时等于不算超过 -> 合格，上限 599s -> 不合格。
+    """
+    show("跨窗连续温度暴露复核：只依各窗当前可用证书的不可变快照")
+    wx = _raw_window("展柜X-跨窗复核", "2026-10-03T03:00:00Z",
+                     "2026-10-03T03:10:00Z")
+    for rid, ts, t in [("a", "2026-10-03T03:00:00Z", 20.0),
+                       ("b", "2026-10-03T03:05:00Z", 23.0),
+                       ("c", "2026-10-03T03:10:00Z", 23.0)]:
+        _raw_reading(wx, rid, ts, t)
+    cx = call("POST", f"/api/v1/windows/{wx}/certificates/issue",
+              {"note": "跨窗复核-窗X"})[1]
+
+    wy = _raw_window("展柜Y-跨窗复核", "2026-10-03T03:10:00Z",
+                     "2026-10-03T03:20:00Z")
+    for rid, ts, t in [("a", "2026-10-03T03:10:00Z", 23.0),
+                       ("b", "2026-10-03T03:15:00Z", 20.0),
+                       ("c", "2026-10-03T03:20:00Z", 20.0)]:
+        _raw_reading(wy, rid, ts, t)
+    cy = call("POST", f"/api/v1/windows/{wy}/certificates/issue",
+              {"note": "跨窗复核-窗Y"})[1]
+
+    # 全程上限 600s：最长连续超限恰为 600s（跨边界累计），等于不算超过 -> pass
+    code, r = exposure_review([cx["id"], cy["id"]], 600)
+    print("上限 600s ->", code, r["verdict"], r["verdict_label_zh"],
+          "最长连续超限:", r["max_continuous_exceeded_seconds"], "s，",
+          "未知总时长:", r["unknown_total_seconds"], "s")
+    assert code == 200 and r["verdict"] == "pass"
+    assert r["max_continuous_exceeded_seconds"] == 600.0
+    assert [w["certificate_id"] for w in r["windows"]] == [cx["id"], cy["id"]]
+    for seg in r["segments"]:
+        print(f"  [{seg['start']}, {seg['end']}) {seg['status']} "
+              f"{seg['duration_seconds']}s <- 证书 {seg['certificate_id']} "
+              f"(窗口 {seg['window_id']})")
+
+    # 严格大于：上限 599s -> fail
+    code, r = exposure_review([cx["id"], cy["id"]], 599)
+    print("上限 599s ->", r["verdict"], r["verdict_label_zh"],
+          "（严格超过才不合格）")
+    assert code == 200 and r["verdict"] == "fail"
+    print(r["conclusion_zh"])
+
+    # 拒绝路径：重复证书 / 少于两张 / 非正上限 -> 422；不存在 -> 404
+    assert exposure_review([cx["id"], cx["id"]], 600)[0] == 422
+    assert exposure_review([cx["id"]], 600)[0] == 422
+    assert exposure_review([cx["id"], cy["id"]], 0)[0] == 422
+    assert exposure_review([cx["id"], 99999], 600)[0] == 404
+    print("拒绝：重复证书/少于两张/非正上限 422，证书不存在 404")
+
+    # 已撤销或非最新版 -> 409；窗口不接续 / 温度范围不一致 / 倒序 -> 422
+    call("POST", f"/api/v1/windows/{wx}/certificates/issue", {"note": "v2"})
+    assert exposure_review([cx["id"], cy["id"]], 600)[0] == 409  # cx 已非最新版
+    wz = _raw_window("展柜Z-不接续", "2026-10-03T05:00:00Z",
+                     "2026-10-03T05:10:00Z")
+    _raw_reading(wz, "a", "2026-10-03T05:00:00Z", 20.0)
+    _raw_reading(wz, "b", "2026-10-03T05:10:00Z", 20.0)
+    cz = call("POST", f"/api/v1/windows/{wz}/certificates/issue", {})[1]
+    # wx 最新版（v2）与不接续窗口 z
+    cx2 = call("GET", f"/api/v1/windows/{wx}/certificates/current")[1]
+    assert exposure_review([cx2["id"], cz["id"]], 600)[0] == 422
+    assert exposure_review([cy["id"], cx2["id"]], 600)[0] == 422  # 倒序
+    print("拒绝：非最新版 409，窗口不接续/倒序 422（不出具部分结果）")
+
+
 if __name__ == "__main__":
     main()
     fault_period_demo()
     handover_demo()
+    exposure_review_demo()
     print("\n全部示例执行完成 ✔")

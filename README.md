@@ -22,7 +22,13 @@
 （**展柜移交放行单**：逐窗口核对当前可用证书且结论合格才一次登记，
 固化各窗口证书标识/版本/结论；同单号按窗口集合重放幂等；
 查询时按同一已提交状态核对引用证书，任一撤销或已有更新版本即整单失效，
-失效不可逆）。
+失效不可逆）；
+馆员复核**一件展品跨多个审定窗口**的连续温度暴露时，可输入按时间排列的
+**至少两张各窗口当前可用证书**与正数全程连续超限上限（秒）：
+窗口须首尾相接且温度上下限一致，服务只从各证书**不可变快照**还原半开审定
+区段（不采用当前读数或规则），跨窗边界两侧均超限时连续累计，正常或未知
+（含故障遮蔽）切断累计，输出逐段状态与来源证书、全程最长连续超限/未知
+总时长与结论；证书或窗口不满足条件时**明确拒绝、不出具部分结果**。
 
 - 技术栈：Python 3.11 · FastAPI · SQLite（WAL 模式）· Pydantic v2
 - 无外部服务依赖，`docker compose up -d` 一键启动并自动初始化数据库
@@ -292,6 +298,56 @@
   `has_newer_version`、`item_valid`；整单 `status` 恒等于各明细
   `item_valid` 的合取。
 
+### 跨审定窗口连续温度暴露复核
+
+馆员复核**一件展品跨多个审定窗口**的连续温度暴露时，
+`GET /api/v1/certificates/exposure-review` 输入：
+
+- **按时间排列的至少两张证书标识**（重复 query 参数
+  `?certificate_id=1&certificate_id=2&...`），每张证书都必须是其所属窗口的
+  **当前可用版本**（最新签发且未撤销；撤销最新版不自动退回旧版）；
+- **正数全程连续超限上限（秒）** `max_continuous_exceed_seconds`。
+
+**输入一致性（任一不满足即明确拒绝，422/404/409，不出具部分结果）**：
+
+- 少于 2 张证书、证书标识重复（含两张证书属于同一审定窗口）、上限非正 →
+  **422**；任一证书不存在 → **404**；
+- 任一证书**已撤销**，或**不是所属窗口最新签发版本**（旧版即使未撤销也不行）
+  → **409**；
+- 相邻审定窗口必须**首尾相接**：前一张快照窗口的终点（半开，不含）恰为后一张
+  窗口的起点（含），且整体按时间升序（倒序、重叠、留间隙均拒绝）→ **422**；
+- 各证书快照的允许温度**上下限必须分别一致**
+  （`allowed_temp_min` / `allowed_temp_max` 相等；各窗采样间隔等其它规则可不同，
+  重建时各窗按各自快照规则）→ 不一致 **422**。
+
+**复核口径（只读）**：
+
+- 从每张证书的**不可变快照**（窗口参数 + 活动读数 + 有效故障时段）重建该窗的
+  半开审定区段，沿用第 1 节的采样保持、采样间隔严格超限未知、边界空白未知、
+  **仪器故障遮蔽未知**语义；**不采用当前读数或当前规则**——签发后再修订读数、
+  登记/撤回故障、修订规则都不影响本次复核结果。
+- 全程在**同一个读事务**内核验并取数（同一已提交状态，不与并发签发/撤销撕裂）；
+  复核为只读 GET，**不撤销、不改证书或移交单**。
+- 把各窗重建区段按时间首尾相接后逐段扫描：**跨窗边界两侧均为超限时连续累计**；
+  正常或未知（含故障遮蔽）一律切断累计。
+- 结论优先级与单窗一致：全程最长连续超限时长**严格大于**上限 → 不合格（fail）；
+  否则只要全程存在未知区段 → 待定（pending）；其余 → 合格（pass）。
+  等于上限不算超过。
+
+输出含：逐窗状态（窗口边界/时长/来源证书标识与版本/正常·超限·未知时长）、
+全程**逐段状态与来源证书**（每段半开 `[start,end)`、`status`、快照证据
+`evidence` 及 `window_id`/`certificate_id`/`certificate_version`，全程区段
+无缝拼接）、全程起点终点与总时长、`normal_total_seconds` /
+`exceeded_total_seconds` / **`unknown_total_seconds`（未知总时长，含故障遮蔽）**、
+**`max_continuous_exceeded_seconds`（全程最长连续超限，跨窗累计）**、
+`max_continuous_exceed_limit_seconds`、`verdict` / `verdict_label_zh`
+及中文结论 `conclusion_zh`。
+
+> 说明：全程区段不跨证书合并——边界两侧即使同为超限也保留为两段并分别标注
+> 来源证书（便于逐证追溯）；是否合并不影响连续累计，两段在边界两侧均超限时
+> 计入同一次连续超限。各窗结果另给
+> `max_continuous_exceeded_seconds_within`（该窗自身最长，不跨窗），仅供逐窗参考。
+
 ---
 
 ## 2. 启动
@@ -462,6 +518,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/v1/certificates/{id}/revocation` | 撤销已签发证书（body `{"reason":"非空原因"}`）：只改有效性，版本/结论/快照不变；同因重放幂等返回原记录，异因 409，空因 422，不存在 404；响应含撤销后窗口当前可用证书 |
 | `GET` | `/api/v1/certificates/{id}` | 按证书主键获取（不存在 404），`snapshot` 为签发时不可变快照，`revoked`/`revocation` 标示撤销状态 |
 | `GET` | `/api/v1/certificates/revision-report?old_certificate_id=&new_certificate_id=` | 对同一窗口两张已签发证书生成修订影响报告（证书即使已撤销也可比对；引用中带撤销标示，比对内容只依快照） |
+| `GET` | `/api/v1/certificates/exposure-review?certificate_id=&certificate_id=&max_continuous_exceed_seconds=` | **跨审定窗口连续温度暴露复核**：至少两张按时间排列、各窗当前可用证书 + 正数全程超限上限；只依各证不可变快照还原半开区段，跨窗边界两侧超限连续累计、正常/未知切断；重复/少于两张/非正上限 422，证书不存在 404，已撤销或非最新版 409，窗口不接续/温度范围不一致/倒序 422（只读，不改证书或移交单） |
 
 证书含 `id`、`window_id`、`version`、`verdict`、`verdict_label_zh`
 （合格/待定/不合格）、`issued_at`、`note`、`revoked`（是否已撤销）、
@@ -652,9 +709,77 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 }
 ```
 
+### 跨审定窗口连续温度暴露复核
+
+请求为只读 GET，证书标识以**重复 query 参数**按时间排列给出（至少两张），
+另给正数全程连续超限上限（秒）：
+
+```bash
+curl -sS -G "http://localhost:8000/api/v1/certificates/exposure-review" \
+  --data-urlencode "certificate_id=15" \
+  --data-urlencode "certificate_id=16" \
+  --data-urlencode "max_continuous_exceed_seconds=600"
+# 等价于：
+# /api/v1/certificates/exposure-review?certificate_id=15&certificate_id=16&max_continuous_exceed_seconds=600
+```
+
+响应（承接上例：窗X 末段与窗Y 首段在边界两侧各超限 300s，连续累计 600s）：
+
+```json
+{
+  "certificates": [
+    {"id": 15, "window_id": 9,  "version": 1, "verdict": "pass", "revoked": false, "...": "..."},
+    {"id": 16, "window_id": 10, "version": 1, "verdict": "pass", "revoked": false, "...": "..."}
+  ],
+  "windows": [
+    {"seq": 0, "window_id": 9, "window_start_at": "2026-10-03T03:00:00Z",
+     "window_end_at": "2026-10-03T03:10:00Z", "duration_seconds": 600.0,
+     "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
+     "certificate_id": 15, "certificate_version": 1, "segment_count": 2,
+     "normal_seconds": 300.0, "exceeded_seconds": 300.0, "unknown_seconds": 0.0,
+     "max_continuous_exceeded_seconds_within": 300.0},
+    {"seq": 1, "window_id": 10, "...": "...", "certificate_id": 16, "...": "..."}
+  ],
+  "segments": [
+    {"seq": 0, "start": "2026-10-03T03:00:00Z", "end": "2026-10-03T03:05:00Z",
+     "duration_seconds": 300.0, "status": "normal",
+     "evidence": {"reading_id": "a", "revision": 1},
+     "window_id": 9, "certificate_id": 15, "certificate_version": 1},
+    {"seq": 1, "start": "2026-10-03T03:05:00Z", "end": "2026-10-03T03:10:00Z",
+     "duration_seconds": 300.0, "status": "exceeded",
+     "evidence": {"reading_id": "b", "revision": 1},
+     "window_id": 9, "certificate_id": 15, "certificate_version": 1},
+    {"seq": 2, "start": "2026-10-03T03:10:00Z", "end": "2026-10-03T03:15:00Z",
+     "duration_seconds": 300.0, "status": "exceeded",
+     "evidence": {"reading_id": "a", "revision": 1},
+     "window_id": 10, "certificate_id": 16, "certificate_version": 1}
+  ],
+  "segment_count": 4,
+  "start_at": "2026-10-03T03:00:00Z", "end_at": "2026-10-03T03:20:00Z",
+  "total_duration_seconds": 1200.0,
+  "normal_total_seconds": 600.0, "exceeded_total_seconds": 600.0,
+  "unknown_total_seconds": 0.0, "has_unknown": false,
+  "max_continuous_exceeded_seconds": 600.0,
+  "max_continuous_exceed_limit_seconds": 600.0,
+  "verdict": "pass", "verdict_label_zh": "合格",
+  "conclusion_zh": "跨窗复核结论：合格（pass）：……结论仅依据各证书不可变快照，不采用当前读数或规则。"
+}
+```
+
+- `segments` 为全程半开区段（按时间升序、首尾相接无缝覆盖），每段含状态与
+  快照证据 `evidence`（已知区段为 `{reading_id, revision}`；未知区段含
+  `unknown_reason=sample_gap|boundary_gap|instrument_fault` 及相应引用），
+  以及来源 `window_id`/`certificate_id`/`certificate_version`。跨窗边界两侧
+  即使同为超限也不合并为一段（分别标注来源证书），但连续时长计入同一次累计。
+- **严格大于**上限才不合格：上例给上限 599 秒即判 `fail`。
+- 任何输入一致性不满足（重复/少于两张/非正上限、证书不存在、已撤销/非最新版、
+  窗口不接续/倒序、温度范围不一致）都返回错误且**响应不含任何分段结果**。
+- 复核只读各证书快照与同一已提交状态，不撤销、不改证书或移交单。
+
 ### 错误约定
 
-- `404`：窗口/证书不存在（修订影响报告中任一证书缺失、撤销目标证书不存在）；
+- `404`：窗口/证书不存在（修订影响报告中任一证书缺失、撤销目标证书不存在，
+  **跨窗连续暴露复核中任一证书不存在**）；
   作废或查询修订历史时读数从未存在；
   **仪器故障时段登记时窗口不存在、撤回时窗口不存在或故障标识在该窗口从未登记（未知标识）**；
   **移交单：申请放行时任一窗口不存在；按单号查询时移交单不存在**
@@ -666,6 +791,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   再次登记；已撤回故障时段以不同原因再次撤回（撤回原因冲突）**；
   **已撤销证书以不同原因再次撤销（原因冲突）；窗口当前没有可用证书时
   查询当前可用证书（尚无证书，或最新签发版本已撤销且不自动退回旧版）**；
+  **跨窗连续暴露复核引用了已撤销证书、或引用证书不是所属窗口最新签发
+  版本（旧版即使未撤销也不是当前可用版本）**；
   **移交单：任一窗口缺当前可用证书或结论非合格（整单不留记录）；
   同一移交单号以不同窗口集合重复申请（集合不一致）**
 - `422`：无效窗口、窗口外读数、同刻不同读数（批量按最终状态判定）、
@@ -676,6 +803,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   登记/撤回原因或故障标识为空或只含空白**；
   **撤销原因为空或只含空白（或缺 `reason` 字段）**；
   修订影响报告的两证书相同、跨审定窗口、版本未按先后排列也返回 422；
+  **跨窗连续暴露复核：证书少于两张、证书标识重复（含两证同属一个窗口）、
+  全程上限非正，以及窗口不首尾相接/未按时间排列（倒序/重叠/留间隙）、
+  各窗允许温度上下限不一致**；
   **移交单：窗口标识列表为空、列表内标识重复、移交单号为空或只含空白**
 
 > 批量补传中任一项命中 409/422，整批回滚，错误 `detail` 指出具体原因；
@@ -688,10 +818,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 服务启动后：
 
 ```bash
-# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告 → 仪器失准故障时段登记/撤回与跨证报告 → 已签发证书撤销 → 展柜移交放行单）
+# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告 → 仪器失准故障时段登记/撤回与跨证报告 → 已签发证书撤销 → 展柜移交放行单 → 跨审定窗口连续温度暴露复核）
 bash examples/curl-examples.sh
 
-# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则版本化修订与跨规则版本报告、仪器失准故障时段登记/撤回与故障遮蔽跨证报告、已签发证书撤销与当前可用证书、展柜移交放行单）
+# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则版本化修订与跨规则版本报告、仪器失准故障时段登记/撤回与故障遮蔽跨证报告、已签发证书撤销与当前可用证书、展柜移交放行单、跨审定窗口连续温度暴露复核）
 python3 examples/python_client.py
 # 或指定地址：
 BASE_URL=http://127.0.0.1:8000 python3 examples/python_client.py
@@ -859,6 +989,27 @@ curl -sS http://localhost:8000/api/v1/handover-orders/HJ-2026-0001
 # 单号不存在 -> 404
 ```
 
+跨审定窗口连续温度暴露复核最小示例（承接同一展品两个首尾相接窗口的当前可用
+证书 `$ECX`（窗口 `[03:00,03:10)`）、`$ECY`（窗口 `[03:10,03:20)`），
+两窗温度区间一致；跨窗边界两侧各超限 300s，连续累计 600s）：
+
+```bash
+# 至少两张按时间排列、各窗当前可用证书（重复 query 参数）+ 正数全程上限（秒）
+curl -sS -G http://localhost:8000/api/v1/certificates/exposure-review \
+  --data-urlencode "certificate_id=$ECX" \
+  --data-urlencode "certificate_id=$ECY" \
+  --data-urlencode "max_continuous_exceed_seconds=600"
+# -> verdict=pass（最长连续超限恰为 600s，等于不算超过）；
+#    上限给 599 -> verdict=fail（严格超过才不合格）；
+#    全程存在未知区段（采样间隔/边界空白/故障遮蔽）且未超限超时 -> pending。
+
+# 拒绝（不出具部分结果）：
+# 重复证书/少于两张/上限非正 -> 422；证书不存在 -> 404；
+# 任一证书已撤销或非所属窗口最新签发版本 -> 409；
+# 窗口不首尾相接/倒序、各窗温度上下限不一致 -> 422。
+# 复核只依各证书不可变快照（不读当前读数/规则），只读、不改证书或移交单。
+```
+
 ---
 
 ## 5. 测试
@@ -904,6 +1055,16 @@ PYTHONPATH=. python -m pytest tests/ -q
   （不计顺序）重放幂等返回原单及当前状态（即使已失效）、集合不同 409；
   查询保留登记明细，撤销或已有更新版本即整单失效且不可逆；
   创建/查询与签发/撤销并发符合提交顺序；旧库自动补建移交单表）。
+- `tests/test_exposure.py`：跨审定窗口连续暴露复核纯函数测试
+  （从各证书不可变快照还原半开区段；跨窗边界两侧超限连续累计、正常/未知
+  （含故障遮蔽）切断；严格超限不合格、有未知待定、其余合格；三窗链式累计；
+  无缝区段与来源标注；少于两证、窗口不接续/重叠/倒序、温度上下限不一致拒绝；
+  温度上下限一致但各窗采样间隔不同允许）。
+- `tests/test_exposure_review_api.py`：跨窗复核 HTTP 集成测试
+  （等于限值合格、严格超过不合格、未知待定；逐段来源证书与无缝拼接；
+  只依快照不受签发后读数/故障变更影响；复核只读不改；重复/少于两张/非正
+  上限 422、不存在 404、已撤销或非最新版 409（撤销最新版不退回旧版、
+  重签恢复）、窗口不接续/倒序/温度不一致 422；拒绝时无部分结果；三窗链）。
 - `tests/test_fault_period_api.py`：仪器失准故障时段 HTTP 集成测试
   （带标识/非空原因/带时区半开时段登记，完全落在窗口内、起点早于终点，
   窗口边界允许；同标识同内容重放幂等、异内容 409、已撤回标识再登记 409；
@@ -920,10 +1081,11 @@ app/
   config.py        # 环境变量配置
   database.py      # SQLite 连接、WAL、建表（含旧库补列迁移/规则第 1 版回填/证书撤销列/移交单表/仪器故障时段表）、写事务（BEGIN IMMEDIATE）与读事务（一致快照）
   evaluation.py    # 核心审定算法（纯函数；含故障时段并集与遮蔽）
+  exposure.py      # 跨审定窗口连续温度暴露复核（纯函数；从各证书不可变快照还原半开区段、跨窗累计与结论）
   report.py        # 修订影响报告（规则前后值、快照比对、故障时段差异、含故障遮蔽的时间线对齐，纯函数）
   models.py        # 结论枚举/常量（含移交单有效状态、仪器故障状态与未知来源）
-  schemas.py       # Pydantic 请求/响应模型（含规则修订、证书撤销、移交放行单、仪器故障时段）
-  services.py      # 窗口、窗口规则版本化修订、读数（含误采作废/恢复）、仪器故障时段（登记/撤回）、审定、签发、证书撤销、修订影响报告、移交放行单业务逻辑
+  schemas.py       # Pydantic 请求/响应模型（含规则修订、证书撤销、移交放行单、仪器故障时段、跨窗连续暴露复核）
+  services.py      # 窗口、窗口规则版本化修订、读数（含误采作废/恢复）、仪器故障时段（登记/撤回）、审定、签发、证书撤销、修订影响报告、移交放行单、跨审定窗口连续暴露复核业务逻辑
   main.py          # FastAPI 路由
 examples/
   curl-examples.sh
