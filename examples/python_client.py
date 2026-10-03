@@ -29,6 +29,11 @@
      409（整单不留记录）；同单号同窗口集合（不计顺序）重放幂等返回原单
      及当前状态，集合不同 409；查询时保留登记明细，任一引用证书撤销或
      已有更新版本即整单失效，失效不可逆（后续再签发不恢复）。
+ 10) 跨审定窗口连续温度暴露复核：按时间排列的至少两张当前可用证书 +
+     正数全程连续超限上限；只从各证不可变快照还原半开区段，跨窗边界
+     两侧均超限连续累计、正常/未知（含故障遮蔽）切断累计；严格超限
+     不合格、有未知待定、其余合格；重复/不存在、已撤销/非最新版、
+     窗口不接续、温度范围不一致均拒绝且不出部分结果（只读，不改证书）。
 """
 from __future__ import annotations
 
@@ -712,8 +717,107 @@ def handover_demo() -> None:
     print("单号不存在查询: 404")
 
 
+def cross_window_review(cert_ids, limit):
+    return call("POST", "/api/v1/cross-window-reviews",
+                {"certificate_ids": cert_ids,
+                 "max_continuous_exceed_seconds": limit})
+
+
+def create_window_range(name, start_hm, end_hm, *, tmin=18.0, tmax=22.0,
+                        max_exceed=300, max_gap=600):
+    """按 HH:MM 创建 2026-10-01 当天窗口（用于跨窗复核的相接窗口）。"""
+    _, w = call("POST", "/api/v1/windows", {
+        "name": name,
+        "start_at": f"2026-10-01T{start_hm}:00Z",
+        "end_at": f"2026-10-01T{end_hm}:00Z",
+        "allowed_temp_min": tmin, "allowed_temp_max": tmax,
+        "max_continuous_exceed_seconds": max_exceed,
+        "max_sample_interval_seconds": max_gap,
+    })
+    return w["id"]
+
+
+def submit_at(wid, rid, hm, temp):
+    return call("POST", f"/api/v1/windows/{wid}/readings",
+                {"reading_id": rid, "revision": 1,
+                 "measured_at": f"2026-10-01T{hm}:00Z", "temperature": temp})
+
+
+def cross_window_demo() -> None:
+    """跨审定窗口连续温度暴露复核：跨边界累计、严格超限与拒绝路径。"""
+    show("跨窗连续温度暴露复核：按时间排列的当前可用证书 + 全程超限上限")
+    # 三个首尾相接、温度范围一致的窗口 02:00-02:30（各 10 分钟）
+    w1 = create_window_range("展柜X-跨窗1", "02:00", "02:10")
+    w2 = create_window_range("展柜X-跨窗2", "02:10", "02:20")
+    w3 = create_window_range("展柜X-跨窗3", "02:20", "02:30")
+    # CW1 末段 [02:05,02:10) 超限 300s；CW2 首段 [02:10,02:15) 超限 300s
+    # （跨边界连续累计 600s，各单窗 300s 恰等于自身限值、单窗结论仍合格）；CW3 全正常
+    plans = [
+        (w1, [("a", "02:00", 20.0), ("b", "02:05", 24.0), ("c", "02:10", 20.0)]),
+        (w2, [("d", "02:10", 24.0), ("e", "02:15", 20.0), ("f", "02:20", 20.0)]),
+        (w3, [("g", "02:20", 20.0), ("h", "02:25", 20.0), ("i", "02:30", 20.0)]),
+    ]
+    cids = []
+    for wid, plan in plans:
+        for rid, hm, t in plan:
+            assert submit_at(wid, rid, hm, t)[0] == 201
+        cids.append(call("POST", f"/api/v1/windows/{wid}/certificates/issue",
+                         {"note": "跨窗复核签发"})[1]["id"])
+
+    # 上限 500s：跨窗边界两侧均超限连续累计 600s > 500s -> 不合格
+    code, d = cross_window_review(cids, 500)
+    print("复核(500s):", code, d["verdict"], d["verdict_label_zh"],
+          "最长连续超限", d["max_continuous_exceeded_seconds"], "s，未知",
+          d["unknown_seconds"], "s")
+    assert code == 201 and d["verdict"] == "fail"
+    assert d["max_continuous_exceeded_seconds"] == 600.0
+    assert [s["certificate_id"] for s in d["sources"]] == cids
+    print("  逐段:", [(s["status"], s["duration_seconds"], s["source"]["certificate_id"])
+                      for s in d["segments"]])
+    print(" ", d["conclusion_zh"])
+
+    # 恰好等于上限不算严格超过且无未知 -> 合格
+    code, d = cross_window_review(cids, 600)
+    assert code == 201 and d["verdict"] == "pass"
+    print("复核(600s):", d["verdict"], "（严格大于口径，等于不判不合格）")
+
+    # 拒绝路径：重复标识/不足两张/非正上限 422；不存在 404；
+    # 已撤销/非最新版 409；顺序错误/窗口不接续/温度范围不一致 422
+    assert cross_window_review([cids[0], cids[0]], 500)[0] == 422
+    assert call("POST", "/api/v1/cross-window-reviews",
+                {"certificate_ids": [cids[0]], "max_continuous_exceed_seconds": 500})[0] == 422
+    assert cross_window_review(cids, 0)[0] == 422
+    assert cross_window_review([cids[0], 99999], 500)[0] == 404
+    assert cross_window_review([cids[1], cids[0], cids[2]], 500)[0] == 422
+    print("拒绝：重复/不足两张/非正上限 422，不存在 404，顺序错误 422（不出部分结果）")
+
+    # 已撤销证书 -> 409；撤销后重签 v2，旧版仍 409、新版可用
+    assert revoke_cert(cids[1], "签发依据有误：读数 d 不可信")[0] == 201
+    assert cross_window_review(cids, 500)[0] == 409
+    c2v2 = call("POST", f"/api/v1/windows/{w2}/certificates/issue",
+                {"note": "撤销后重签 v2"})[1]
+    assert cross_window_review(cids, 500)[0] == 409          # 旧版已撤销
+    code, d = cross_window_review([cids[0], c2v2["id"], cids[2]], 500)
+    assert code == 201 and d["verdict"] == "fail"
+    print("已撤销/非最新版证书 409；改用重签后的当前可用证书后复核成功")
+
+    # 窗口不接续 / 温度范围不一致 -> 422（均明确拒绝，不出部分结果）
+    wx = create_window_range("展柜X-不相接", "03:00", "03:10")
+    for rid, hm in (("a", "03:00"), ("b", "03:10")):
+        assert submit_at(wx, rid, hm, 20.0)[0] == 201
+    cx = call("POST", f"/api/v1/windows/{wx}/certificates/issue", {})[1]
+    assert cross_window_review([cids[2], cx["id"]], 500)[0] == 422
+    wz = create_window_range("展柜X-温度带不同", "02:30", "02:40", tmin=18.5)
+    for rid, hm in (("a", "02:30"), ("b", "02:35"), ("c", "02:40")):
+        assert submit_at(wz, rid, hm, 20.0)[0] == 201
+    cz = call("POST", f"/api/v1/windows/{wz}/certificates/issue", {})[1]
+    assert cross_window_review([cids[2], cz["id"]], 500)[0] == 422
+    print("窗口不接续 / 温度范围不一致 422，拒绝响应只含 detail、无任何分段部分结果")
+
+
 if __name__ == "__main__":
     main()
     fault_period_demo()
     handover_demo()
+    cross_window_demo()
     print("\n全部示例执行完成 ✔")

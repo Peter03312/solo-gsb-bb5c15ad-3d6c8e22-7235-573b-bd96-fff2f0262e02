@@ -437,3 +437,44 @@ api POST /api/v1/handover-orders "{\"handover_no\":\"$HNO\",\"window_ids\":[$H1,
 api POST "/api/v1/windows/$H1/certificates/issue" '{"note":"撤销后重签"}' >/dev/null
 api GET /api/v1/handover-orders/$HNO \
   | python3 -c "import sys,json;o=json.load(sys.stdin);print('再签发后 status:',o['status']);print('明细仍固化:',[(i['certificate_id'],i['certificate_version'],i['verdict']) for i in o['items']])"
+
+echo "== 18. 跨审定窗口连续温度暴露复核（按时间排列的当前可用证书 + 正数全程超限上限）=="
+# 三个首尾相接、温度范围一致的窗口：02:00-02:10 / 02:10-02:20 / 02:20-02:30
+mk_cw_window() { # idx start end
+  api POST /api/v1/windows "{
+    \"name\":\"跨窗复核窗口-$1\",\"start_at\":\"2026-10-01T$2:00Z\",\"end_at\":\"2026-10-01T$3:00Z\",
+    \"allowed_temp_min\":18.0,\"allowed_temp_max\":22.0,
+    \"max_continuous_exceed_seconds\":300,\"max_sample_interval_seconds\":600
+  }" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])"
+}
+CW1=$(mk_cw_window 1 02:00 02:10)
+CW2=$(mk_cw_window 2 02:10 02:20)
+CW3=$(mk_cw_window 3 02:20 02:30)
+# CW1 末段 [02:05,02:10) 超限 300s；CW2 首段 [02:10,02:15) 超限 300s；CW3 全正常
+post_cw() { api POST "/api/v1/windows/$1/readings" "{\"reading_id\":\"$2\",\"revision\":1,\"measured_at\":\"2026-10-01T$3:00Z\",\"temperature\":$4}" >/dev/null; }
+post_cw $CW1 a 02:00 20.0; post_cw $CW1 b 02:05 24.0; post_cw $CW1 c 02:10 20.0
+post_cw $CW2 d 02:10 24.0; post_cw $CW2 e 02:15 20.0; post_cw $CW2 f 02:20 20.0
+post_cw $CW3 g 02:20 20.0; post_cw $CW3 h 02:25 20.0; post_cw $CW3 i 02:30 20.0
+CC1=$(api POST "/api/v1/windows/$CW1/certificates/issue" '{"note":"跨窗复核-窗1"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+CC2=$(api POST "/api/v1/windows/$CW2/certificates/issue" '{"note":"跨窗复核-窗2"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+CC3=$(api POST "/api/v1/windows/$CW3/certificates/issue" '{"note":"跨窗复核-窗3"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+
+echo "-- 18.1 复核（上限 500s）：两窗各 300s 在边界连续累计为 600s > 500s -> 不合格 --"
+api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC1,$CC2,$CC3],\"max_continuous_exceed_seconds\":500}" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('verdict:',d['verdict'],d['verdict_label_zh']);print('最长连续超限:',d['max_continuous_exceeded_seconds'],'s；未知总时长:',d['unknown_seconds'],'s');print('分段:',[(s['status'],s['duration_seconds'],s['source']['certificate_id']) for s in d['segments']]);print(d['conclusion_zh'])"
+
+echo "-- 18.2 恰好等于上限（600s）不算严格超过且无未知 -> 合格 --"
+api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC1,$CC2,$CC3],\"max_continuous_exceed_seconds\":600}" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('verdict:',d['verdict'],d['verdict_label_zh'],'最长连续超限:',d['max_continuous_exceeded_seconds'])"
+
+echo "-- 18.3 拒绝路径：重复标识/不足两张/非正上限 422；不存在 404；已撤销或非最新版 409；窗口不接续/温度范围不一致/顺序错误 422 --"
+api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC1,$CC1,$CC3],\"max_continuous_exceed_seconds\":500}" || true
+api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC1],\"max_continuous_exceed_seconds\":500}" || true
+api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC1,$CC2],\"max_continuous_exceed_seconds\":0}" || true
+api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC1,99999],\"max_continuous_exceed_seconds\":500}" || true
+api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC2,$CC1,$CC3],\"max_continuous_exceed_seconds\":500}" || true
+api POST /api/v1/certificates/$CC2/revocation '{"reason":"签发依据有误：读数 d 不可信"}' >/dev/null
+api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC1,$CC2,$CC3],\"max_continuous_exceed_seconds\":500}" || true
+# 撤销后窗2重签 v2 恢复当前可用；旧版 CC2 仍为已撤销不可用
+api POST "/api/v1/windows/$CW2/certificates/issue" '{"note":"撤销后重签 v2"}' >/dev/null
+api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC1,$CC2,$CC3],\"max_continuous_exceed_seconds\":500}" || true

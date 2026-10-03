@@ -8,6 +8,7 @@ from typing import Any, Optional
 from fastapi import HTTPException, status
 
 from .evaluation import evaluate
+from .cross_window import CrossWindowError, build_cross_window_review
 from .models import (
     FAULT_ACTIVE,
     FAULT_WITHDRAWN,
@@ -1328,6 +1329,72 @@ def revision_report(conn: sqlite3.Connection,
     old_cert = certificate_to_dict(old_row)
     new_cert = certificate_to_dict(new_row)
     return build_revision_report(old_cert, new_cert)
+
+
+# ---------------------------------------------------------------- 跨窗连续温度暴露复核
+
+def cross_window_review(
+    conn: sqlite3.Connection,
+    certificate_ids: list[int],
+    max_continuous_exceed_seconds: float,
+) -> dict[str, Any]:
+    """跨审定窗口连续温度暴露复核（只读；调用方须持有读事务，取同一已提交状态）。
+
+    - 证书标识重复 -> 422；证书不存在 -> 404；
+    - 任一证书已撤销或不是其窗口最新签发版本（非当前可用证书）-> 409；
+    - 窗口不接续、温度范围不一致、未按时间先后排列、证书不足 2 张
+      -> 422（CrossWindowError 统一映射）。
+    校验全部通过后才从各证书不可变快照还原半开审定区段并出具完整结果；
+    任一校验失败都不出具部分结果。全程不修改证书、读数、规则或移交单。
+    """
+    # 1) 重复证书标识（请求模型 min_length 已保证至少 2 张）
+    seen: set[int] = set()
+    for cid in certificate_ids:
+        if cid in seen:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"跨窗复核拒收：证书标识 {cid} 在列表中重复，证书标识不得重复。",
+            )
+        seen.add(cid)
+
+    # 2) 逐张取证书（不存在 -> 404），并核对其为所属窗口当前可用版本：
+    #    最新签发版本且未撤销（撤销最新版不自动退回旧版，故旧版即使未撤销
+    #    也不是当前可用证书）。全部读取发生在同一读事务 -> 同一已提交状态。
+    certs: list[dict[str, Any]] = []
+    for cid in certificate_ids:
+        row = get_certificate_row(conn, cid)
+        if row["revoked_reason"] is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"证书 {cid} 已撤销，不是窗口 {row['window_id']} 的当前可用证书，"
+                    "拒绝跨窗复核：复核只接受各窗口最新签发且未撤销的证书"
+                    "（撤销最新版不自动退回旧版，请改用重新签发后的当前可用证书）。"
+                ),
+            )
+        latest = conn.execute(
+            "SELECT id, version FROM certificates WHERE window_id=? ORDER BY version DESC LIMIT 1",
+            (row["window_id"],),
+        ).fetchone()
+        if latest is None or latest["id"] != row["id"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"证书 {cid}（窗口 {row['window_id']} 版本 {row['version']}）"
+                    f"不是该窗口最新签发版本（最新为版本 {latest['version'] if latest else '?'}），"
+                    "非当前可用证书，拒绝跨窗复核：请改用各窗口最新签发版本的证书。"
+                ),
+            )
+        certs.append(certificate_to_dict(row))
+
+    # 3) 结构性校验 + 从不可变快照还原并累计（任一不满足均拒绝，不出部分结果）
+    try:
+        return build_cross_window_review(certs, max_continuous_exceed_seconds)
+    except CrossWindowError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
 
 
 # ---------------------------------------------------------------- 移交放行单

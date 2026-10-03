@@ -660,6 +660,99 @@ class HandoverOrderSubmitResponse(BaseModel):
     order: HandoverOrderOut
 
 
+# ------------------------------------------------------------ 跨窗连续温度暴露复核
+
+class CrossWindowReviewSubmit(BaseModel):
+    """馆员复核一件展品跨多个审定窗口的连续温度暴露。
+
+    - certificate_ids：按审定窗口时间先后排列的证书主键列表，至少 2 张，
+      不得重复；每张都必须是所属窗口的**当前可用证书**（最新签发版本且未
+      撤销——已撤销或非最新版本一律拒绝）；
+    - max_continuous_exceed_seconds：**正数**全程连续超限上限（秒）。全程
+      最长连续超限（跨窗边界两侧均超限连续累计；正常/未知含故障遮蔽切断
+      累计）严格超过它判不合格；否则有未知判待定；其余合格。
+    - 窗口须首尾相接（前一窗口半开终点恰为后一窗口起点），且各窗口允许
+      温度上下限完全一致；任一不满足均 422 明确拒绝，不出具部分结果。
+    - 只读复核：仅从各证书不可变快照还原半开审定区段，不读取当前读数/规则，
+      不修改证书或移交单。
+    """
+
+    certificate_ids: list[int] = Field(
+        ..., min_length=2,
+        description="按审定窗口时间先后排列的证书主键（至少 2 张，不得重复；须均为所属窗口当前可用版本）")
+    max_continuous_exceed_seconds: float = Field(
+        ..., description="全程连续超限上限（秒，正数）；全程最长连续超限严格超过它判不合格")
+
+    @field_validator("max_continuous_exceed_seconds")
+    @classmethod
+    def _finite_positive(cls, v: float) -> float:
+        if math.isnan(v) or math.isinf(v):
+            raise ValueError("全程连续超限上限必须为有限数值")
+        if v <= 0:
+            raise ValueError("全程连续超限上限必须为正数")
+        return v
+
+
+class CrossWindowSegmentSourceOut(BaseModel):
+    """区段来源证书：该半开区段由哪张证书的不可变快照还原。"""
+
+    certificate_id: int
+    window_id: int
+    version: int
+
+
+class CrossWindowSegmentOut(BaseModel):
+    """全程时间线上的一个半开区段（仅在同一来源证书窗口内合并相邻同状态区段；
+    跨窗边界即使状态相同也不跨证合并，以便逐段标注来源证书）。"""
+
+    start: str
+    end: str
+    status: str = Field(..., description="normal | exceeded | unknown（unknown 含故障遮蔽）")
+    duration_seconds: float
+    source: CrossWindowSegmentSourceOut = Field(..., description="还原该区段所用的证书（不可变快照来源）")
+
+
+class CrossWindowSourceOut(BaseModel):
+    """参与复核的一张来源证书及其快照窗口关键参数。"""
+
+    certificate_id: int
+    window_id: int
+    version: int
+    verdict: str = Field(..., description="该证书签发时固化的单窗结论")
+    verdict_label_zh: str
+    start_at: str
+    end_at: str
+    allowed_temp_min: float
+    allowed_temp_max: float
+    rule_revision: int = Field(..., description="该证书快照所属规则修订号（旧快照按第 1 版）")
+    segment_count: int
+    unknown_seconds: float = Field(..., description="该证书窗口内未知区段总时长（秒，含故障遮蔽）")
+    max_continuous_exceeded_seconds: Optional[float] = Field(
+        None, description="该证书快照内固化的单窗最长连续超限时长（秒）")
+
+
+class CrossWindowReviewOut(BaseModel):
+    max_continuous_exceed_seconds: float = Field(
+        ..., description="本次复核使用的全程连续超限上限（秒）")
+    timeline_start: str
+    timeline_end: str
+    total_seconds: float
+    segments: list[CrossWindowSegmentOut] = Field(
+        ..., description="逐段状态（半开区段，按时间升序）与来源证书")
+    segment_count: int
+    sources: list[CrossWindowSourceOut] = Field(
+        ..., description="按时间先后参与复核的来源证书及各自快照窗口参数")
+    max_continuous_exceeded_seconds: float = Field(
+        ..., description="全程最长连续超限时长（跨窗边界两侧均超限连续累计，正常/未知切断）")
+    normal_seconds: float
+    exceeded_seconds: float
+    unknown_seconds: float = Field(..., description="未知总时长（秒；未知含采样间隔超限、边界空白与仪器故障遮蔽）")
+    has_unknown: bool
+    verdict: str = Field(..., description="fail | pending | pass")
+    verdict_label_zh: str
+    conclusion_zh: str
+
+
 class ErrorBody(BaseModel):
     detail: str
 

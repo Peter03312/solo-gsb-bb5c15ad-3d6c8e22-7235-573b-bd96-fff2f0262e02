@@ -14,6 +14,8 @@ from .schemas import (
     CertificateOut,
     CertificateRevokeResponse,
     CertificateRevokeSubmit,
+    CrossWindowReviewOut,
+    CrossWindowReviewSubmit,
     EvaluationOut,
     FaultPeriodOut,
     FaultPeriodResponse,
@@ -54,7 +56,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
@@ -71,7 +73,14 @@ app = FastAPI(
         "馆员办理展柜移交时凭非空移交单号与非空窗口标识列表申请放行："
         "逐窗口核对当前可用证书且结论合格才一次登记（固化证书标识/版本/结论），"
         "查询时按同一已提交状态核对引用证书，任一撤销或已有更新版本即整单失效"
-        "（失效不可逆，后续再签发不恢复）。"
+        "（失效不可逆，后续再签发不恢复）；"
+        "馆员复核展品跨多个首尾相接审定窗口的连续温度暴露时，凭按时间排列的"
+        "至少两张当前可用证书与正数全程连续超限上限申请只读复核："
+        "从各证不可变快照还原半开区段（不用当前读数/规则），跨窗边界两侧均"
+        "超限连续累计、正常或未知（含故障遮蔽）切断累计，输出逐段状态与来源"
+        "证书、全程最长连续超限时长、未知总时长与结论；重复/不存在证书、"
+        "已撤销或非最新版证书、窗口不接续、温度范围不一致均明确拒绝且不出"
+        "部分结果，复核取同一已提交状态且不改证书或移交单。"
     ),
     lifespan=lifespan,
 )
@@ -475,6 +484,39 @@ def get_certificate(
     certificate_id: int, conn: sqlite3.Connection = Depends(get_conn)
 ) -> dict[str, Any]:
     return services.get_certificate(conn, certificate_id)
+
+
+# ---------------------------------------------------------------- 跨窗连续温度暴露复核
+
+@app.post(
+    "/api/v1/cross-window-reviews",
+    response_model=CrossWindowReviewOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["cross-window"],
+)
+def create_cross_window_review(
+    payload: CrossWindowReviewSubmit,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """馆员复核一件展品跨多个审定窗口的连续温度暴露（只读复核）。
+
+    输入按时间排列的至少两张证书主键及正数全程连续超限上限（秒）：
+    - 每张证书都必须是所属窗口的**当前可用证书**（最新签发版本且未撤销；
+      已撤销或非最新版 -> 409）；证书标识重复 -> 422；不存在 -> 404；
+    - 从各证书**不可变快照**还原半开审定区段（采样保持/间隔超限未知/
+      边界空白未知/仪器故障遮蔽未知），不采用当前读数或规则；
+    - 窗口须首尾相接（前窗半开终点恰为后窗起点）且各窗口温度上下限一致，
+      输入须按窗口时间先后排列（不代为排序）；任一不满足 -> 422，
+      **明确拒绝、不出具部分结果**；
+    - 输出逐段状态与来源证书、全程最长连续超限时长（跨窗边界两侧均超限
+      连续累计，正常/未知含故障遮蔽切断累计）、未知总时长及结论；
+    - 最长时长严格超过全程上限 -> 不合格；否则有未知 -> 待定；其余合格。
+    复核为只读 GET 式核对（POST 承载结构化输入）：在同一读事务内取同一
+    已提交状态，不修改证书、读数、规则或移交单。
+    """
+    with read_transaction(conn):
+        return services.cross_window_review(
+            conn, payload.certificate_ids, payload.max_continuous_exceed_seconds)
 
 
 # ---------------------------------------------------------------- 移交放行单
